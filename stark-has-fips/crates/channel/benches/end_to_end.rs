@@ -138,7 +138,7 @@ fn bench_e2e_mf_fri(c: &mut Criterion) {
     g.measurement_time(Duration::from_secs(20));
     g.sample_size(10);
 
-    let r: usize = 52;
+    let r: usize = 40;
     let seed_z: u64 = 0xDEEF_BAAD;
     let k_lo = 11usize;
     let k_hi = 25usize;
