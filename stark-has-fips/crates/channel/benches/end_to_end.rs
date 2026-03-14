@@ -140,8 +140,8 @@ fn bench_e2e_mf_fri(c: &mut Criterion) {
 
     let r: usize = 52;
     let seed_z: u64 = 0xDEEF_BAAD;
-    let k_lo = 20usize;
-    let k_hi = 20usize;
+    let k_lo = 11usize;
+    let k_hi = 25usize;
 
     let presets: &[(&str, &[usize])] = &[
         ("2power16", &[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]),
