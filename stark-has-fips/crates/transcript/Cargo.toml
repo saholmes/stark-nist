@@ -1,0 +1,41 @@
+[package]
+name = "transcript"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[features]
+# No default feature selects Blake3 via code-side const SELECTED_FS_HASH
+default = []
+
+# Existing feature toggles
+transcript-sha3 = []
+transcript-poseidon = []
+transcript-keccak = ["dep:tiny-keccak"]
+
+# Feature aliases for convenience
+sha3 = ["transcript-sha3"]
+poseidon = ["transcript-poseidon"]
+keccak = ["transcript-keccak"]
+blake3 = []  # optional convenience alias; keeps Blake3 selected explicitly
+
+[dependencies]
+# If you have workspace-managed versions, you can replace these with `{ workspace = true }`.
+ark-ff = { workspace = true }
+ark-goldilocks = { workspace = true }
+
+# Poseidon crate (local path as in your project)
+poseidon = { path = "../poseidon" }
+
+# Backends for the Fiat–Shamir transcript
+sha3 = "0.10"
+blake3 = "1"
+tiny-keccak = { version = "2", optional = true, features = ["keccak"] }
+
+# Optional: if you serialize transcript state anywhere
+serde = { version = "1", features = ["derive"], optional = true }
+
+once_cell = "1.19"
+
+[dev-dependencies]
+# Add any test-only deps here if needed

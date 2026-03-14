@@ -1,0 +1,37 @@
+[package]
+name = "deep_ali"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "DEEP-ALI and FRI scaffolding"
+repository = "https://example.com/your/repo"
+
+[features]
+default = []
+parallel = ["dep:rayon"]
+fri_bench_log = []
+
+[dependencies]
+ark-ff = { version = "0.4.2" }
+ark-poly = "0.4.2"
+ark-serialize = "0.4.2"
+rand = { version = "0.8", features = ["std", "std_rng"] }
+blake3 = "1.5"
+once_cell = "1.19"
+hex = "0.4"
+rayon = { version = "1.10", optional = true }
+merkle = { path = "../merkle" }
+transcript = { path = "../transcript" }
+poseidon = { path = "../poseidon" }
+ark-goldilocks = { path = "../ark-goldilocks" }
+sha3 = "0.10"
+
+
+[dev-dependencies]
+ark-ff = "0.4.2"
+ark-poly = "0.4.2"
+ark-serialize = "0.4.2"
+rand = { version = "0.8", features = ["std", "std_rng"] }
+blake3 = "1.5"
+once_cell = "1.19"
+hex = "0.4"
