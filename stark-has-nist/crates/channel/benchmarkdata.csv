@@ -1,0 +1,5 @@
+csv,label,k,schedule,proof_bytes,prove_s,verify_ms,prove_elems_per_s,delta_size_pct_vs_paper,delta_prove_pct_vs_paper,delta_verify_pct_vs_paper,delta_throughput_pct_vs_paper
+csv,884,11,[8,8,4,8],176032,0.008956,0.586,228664.987259,0.00,0.00,0.00,0.00
+csv,884,12,[8,8,4,16],186272,0.017793,0.609,230202.345389,0.00,0.00,0.00,0.00
+csv,paper,11,[16,16,8],190352,0.008318,0.522,246201.932469,0.00,0.00,0.00,0.00
+csv,paper,12,[16,16,8,2],208032,0.016499,0.617,248255.589312,0.00,0.00,0.00,0.00
