@@ -10,11 +10,15 @@ default = []
 
 # Existing feature toggles
 transcript-sha3 = []
+transcript-sha3-384 = []
+transcript-sha3-512 = []
 transcript-poseidon = []
 transcript-keccak = ["dep:tiny-keccak"]
 
 # Feature aliases for convenience
 sha3 = ["transcript-sha3"]
+sha3-384 = ["transcript-sha3-384"]
+sha3-512 = ["transcript-sha3-512"]
 poseidon = ["transcript-poseidon"]
 keccak = ["transcript-keccak"]
 blake3 = []  # optional convenience alias; keeps Blake3 selected explicitly
