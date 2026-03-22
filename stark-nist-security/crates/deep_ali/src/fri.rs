@@ -164,7 +164,7 @@ fn eval_poly_at_ext<E: TowerField>(coeffs: &[F], z: E) -> E {
 
 /// DEEP quotient for a **base-field** codeword evaluated against z ∈ E.
 /// Used for layer 0, where the trace values are in F_p.
-fn compute_q_layer_ext<E: TowerField>(
+fn compute_q_layer_ext<E: TowerField + Send + Sync>(
     f_l: &[F],
     z: E,
     omega: F,
@@ -174,23 +174,49 @@ fn compute_q_layer_ext<E: TowerField>(
     let coeffs = dom.ifft(f_l);
     let fz = eval_poly_at_ext(&coeffs, z);
 
-    let mut q = Vec::with_capacity(n);
-    let mut x = E::one();
+    // ── Precompute domain points sequentially (O(n) cheap muls) ──
     let omega_ext = E::from_fp(omega);
-    for i in 0..n {
-        let num   = E::from_fp(f_l[i]) - fz;
-        let denom = x - z;
-        q.push(ext_div(num, denom));
-        x = x * omega_ext;
-    }
+    let xs: Vec<E> = {
+        let mut v = Vec::with_capacity(n);
+        let mut x = E::one();
+        for _ in 0..n {
+            v.push(x);
+            x = x * omega_ext;
+        }
+        v
+    };
+
+    // ── Quotient: each ext_div is independent ──
+    #[cfg(feature = "parallel")]
+    let q: Vec<E> = f_l
+        .par_iter()
+        .zip(xs.par_iter())
+        .map(|(&fi, &xi)| {
+            let num   = E::from_fp(fi) - fz;
+            let denom = xi - z;
+            ext_div(num, denom)
+        })
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
+    let q: Vec<E> = f_l
+        .iter()
+        .zip(xs.iter())
+        .map(|(&fi, &xi)| {
+            let num   = E::from_fp(fi) - fz;
+            let denom = xi - z;
+            ext_div(num, denom)
+        })
+        .collect();
+
     (q, fz)
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  Extension-field FRI core functions — generic over E : TowerField
+//  Extension-field FRI core — generic over E : TowerField
 // ────────────────────────────────────────────────────────────────────────
 
-fn compute_q_layer_ext_on_ext<E: TowerField>(
+fn compute_q_layer_ext_on_ext<E: TowerField + Send + Sync>(
     f_l: &[E],
     z: E,
     omega: F,
@@ -199,6 +225,7 @@ fn compute_q_layer_ext_on_ext<E: TowerField>(
     let d = E::DEGREE;
     let dom = Domain::<F>::new(n).unwrap();
 
+    // ── Transpose: extract per-component evaluation vectors ──
     let mut comp_evals: Vec<Vec<F>> = vec![Vec::with_capacity(n); d];
     for elem in f_l {
         let comps = elem.to_fp_components();
@@ -207,11 +234,20 @@ fn compute_q_layer_ext_on_ext<E: TowerField>(
         }
     }
 
+    // ── IFFT across the d independent components ──
+    #[cfg(feature = "parallel")]
+    let comp_coeffs: Vec<Vec<F>> = comp_evals
+        .par_iter()
+        .map(|evals| dom.ifft(evals))
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
     let comp_coeffs: Vec<Vec<F>> = comp_evals
         .iter()
         .map(|evals| dom.ifft(evals))
         .collect();
 
+    // ── Horner evaluation for f(z) — sequential (data-dependent) ──
     let mut fz = E::zero();
     for k in (0..n).rev() {
         let coeff_comps: Vec<F> = (0..d).map(|j| comp_coeffs[j][k]).collect();
@@ -220,15 +256,40 @@ fn compute_q_layer_ext_on_ext<E: TowerField>(
         fz = fz * z + coeff_k;
     }
 
-    let mut q = Vec::with_capacity(n);
-    let mut x = E::one();
+    // ── Precompute domain points sequentially ──
     let omega_ext = E::from_fp(omega);
-    for i in 0..n {
-        let num   = f_l[i] - fz;
-        let denom = x - z;
-        q.push(ext_div(num, denom));
-        x = x * omega_ext;
-    }
+    let xs: Vec<E> = {
+        let mut v = Vec::with_capacity(n);
+        let mut x = E::one();
+        for _ in 0..n {
+            v.push(x);
+            x = x * omega_ext;
+        }
+        v
+    };
+
+    // ── Quotient computation ──
+    #[cfg(feature = "parallel")]
+    let q: Vec<E> = f_l
+        .par_iter()
+        .zip(xs.par_iter())
+        .map(|(&fi, &xi)| {
+            let num   = fi - fz;
+            let denom = xi - z;
+            ext_div(num, denom)
+        })
+        .collect();
+
+    #[cfg(not(feature = "parallel"))]
+    let q: Vec<E> = f_l
+        .iter()
+        .zip(xs.iter())
+        .map(|(&fi, &xi)| {
+            let num   = fi - fz;
+            let denom = xi - z;
+            ext_div(num, denom)
+        })
+        .collect();
 
     (q, fz)
 }
