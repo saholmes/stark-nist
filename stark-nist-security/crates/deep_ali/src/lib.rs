@@ -188,3 +188,4 @@ pub mod deep;
 pub mod cubic_ext;
 pub mod tower_field;
 pub mod sextic_ext;
+pub mod octic_ext;

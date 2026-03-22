@@ -45,6 +45,10 @@ use deep_ali::sextic_ext::SexticExt;
 
 type Ext = SexticExt;  // Fp⁶ = Fp³[u]/(u² − α)
 
+//use deep_ali::octic_ext::OcticExt;
+
+//type Ext = OcticExt;  // Fp⁶ = Fp³[u]/(u² − α)
+
 // ---------------------
 // CSV record
 // ---------------------
@@ -156,20 +160,20 @@ fn bench_e2e_mf_fri(c: &mut Criterion) {
     g.measurement_time(Duration::from_secs(20));
     g.sample_size(10);
 
-    let r: usize = 40;
+    let r: usize = 87;
     let seed_z: u64 = 0xDEEF_BAAD;
     let k_lo = 11usize;
     let k_hi = 25usize;
 
     let presets: &[(&str, &[usize])] = &[
         ("2power16", &[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]),
-        ("4x4x4", &[4,4,4,4,4,4,4,4]),
-        ("884", &[8,8,4]),
-        ("paper", &[16, 16, 8]),
-        ("mod16", &[16, 16, 16, 16]),
-        ("uni32x3", &[32, 32, 32]),
-        ("uni64x2x8", &[64, 64, 8]),
-        ("hi128_32_8", &[128, 32, 8]),
+        //("4x4x4", &[4,4,4,4,4,4,4,4]),
+        //("884", &[8,8,4]),
+        //("paper", &[16, 16, 8]),
+        //("mod16", &[16, 16, 16, 16]),
+        //("uni32x3", &[32, 32, 32]),
+        //("uni64x2x8", &[64, 64, 8]),
+        //("hi128_32_8", &[128, 32, 8]),
     ];
 
     let file = File::create("benchmarkdata.csv").unwrap();
