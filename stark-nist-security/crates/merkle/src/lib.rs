@@ -11,7 +11,6 @@ use hash::sha3::Digest;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-
 /// =======================
 /// Serialization helpers
 /// =======================
@@ -163,6 +162,31 @@ fn compress_leaf_standalone(
     finalize_hash(h)
 }
 
+/// Free helper: hash a single internal node (no &self needed)
+fn compress_node_standalone(
+    arity: usize,
+    tree_label: u64,
+    level: u32,
+    position: u64,
+    children: &[[u8; HASH_BYTES]],
+) -> [u8; HASH_BYTES] {
+    let ds = DsLabel {
+        arity,
+        level,
+        position,
+        tree_label,
+    };
+    let mut h = SelectedHasher::new();
+    Digest::update(&mut h, ds.to_bytes());
+    for c in children {
+        Digest::update(&mut h, c);
+    }
+    finalize_hash(h)
+}
+
+/// Minimum leaf count to bother spawning rayon tasks
+const PARALLEL_THRESHOLD: usize = 256;
+
 /// =======================
 /// Merkle tree
 /// =======================
@@ -215,24 +239,33 @@ impl MerkleTreeChannel {
         self.levels[0].push(leaf);
     }
 
-    /// Bulk-insert all leaves, using rayon when `parallel` is enabled.
+    /// Bulk-insert all leaves, parallel when feature is active and count is large enough.
     pub fn push_leaves_parallel(&mut self, all_values: &[Vec<F>]) {
         if self.levels.is_empty() {
             self.levels.push(Vec::new());
         }
 
-        // Pull config out before the closure so we don't borrow &self inside par_iter
         let arity = self.cfg.layer_arities[0];
         let tree_label = self.cfg.tree_label;
 
         #[cfg(feature = "parallel")]
-        let leaves: Vec<[u8; HASH_BYTES]> = all_values
-            .par_iter()
-            .enumerate()
-            .map(|(idx, values)| {
-                compress_leaf_standalone(arity, tree_label, idx as u64, values)
-            })
-            .collect();
+        let leaves: Vec<[u8; HASH_BYTES]> = if all_values.len() >= PARALLEL_THRESHOLD {
+            all_values
+                .par_iter()
+                .enumerate()
+                .map(|(idx, values)| {
+                    compress_leaf_standalone(arity, tree_label, idx as u64, values)
+                })
+                .collect()
+        } else {
+            all_values
+                .iter()
+                .enumerate()
+                .map(|(idx, values)| {
+                    compress_leaf_standalone(arity, tree_label, idx as u64, values)
+                })
+                .collect()
+        };
 
         #[cfg(not(feature = "parallel"))]
         let leaves: Vec<[u8; HASH_BYTES]> = all_values
@@ -257,17 +290,32 @@ impl MerkleTreeChannel {
                 cur.resize(cur.len() + (arity - cur.len() % arity), last);
             }
 
+            let tree_label = self.cfg.tree_label;
+            let parent_level = level as u32 + 1;
+
+            #[cfg(feature = "parallel")]
+            let parents: Vec<[u8; HASH_BYTES]> = if cur.len() / arity >= PARALLEL_THRESHOLD {
+                cur.par_chunks(arity)
+                    .enumerate()
+                    .map(|(i, c)| {
+                        compress_node_standalone(arity, tree_label, parent_level, i as u64, c)
+                    })
+                    .collect()
+            } else {
+                cur.chunks(arity)
+                    .enumerate()
+                    .map(|(i, c)| {
+                        compress_node_standalone(arity, tree_label, parent_level, i as u64, c)
+                    })
+                    .collect()
+            };
+
+            #[cfg(not(feature = "parallel"))]
             let parents: Vec<[u8; HASH_BYTES]> = cur
                 .chunks(arity)
                 .enumerate()
                 .map(|(i, c)| {
-                    let ds = DsLabel {
-                        arity,
-                        level: level as u32 + 1,
-                        position: i as u64,
-                        tree_label: self.cfg.tree_label,
-                    };
-                    self.compress_node(ds, c)
+                    compress_node_standalone(arity, tree_label, parent_level, i as u64, c)
                 })
                 .collect();
 
