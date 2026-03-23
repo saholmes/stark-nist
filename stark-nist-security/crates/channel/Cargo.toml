@@ -1,3 +1,5 @@
+# crates/channel/Cargo.toml
+
 [package]
 name = "channel"
 version = "0.1.0"
@@ -7,8 +9,10 @@ license = "Apache-2.0"
 [features]
 default = ["parallel", "sha3-256"]
 parallel = [
+    "deep_ali/parallel",
+    "merkle/parallel",
     "poseidon/parallel",
-    "ark-ff/parallel"
+    "ark-ff/parallel",
 ]
 fs_blake3 = ["transcript/blake3"]
 poseidon = ["transcript/poseidon"]

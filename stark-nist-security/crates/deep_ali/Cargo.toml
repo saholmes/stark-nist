@@ -7,9 +7,9 @@ description = "DEEP-ALI and FRI scaffolding"
 repository = "https://example.com/your/repo"
 
 [features]
+default    = []
 parallel = ["dep:rayon"]
 fri_bench_log = []
-default    = []
 sha3-256   = ["hash/sha3-256",   "merkle/sha3-256",   "transcript/sha3-256"]
 sha3-384   = ["hash/sha3-384",   "merkle/sha3-384",   "transcript/sha3-384"]
 sha3-512   = ["hash/sha3-512",   "merkle/sha3-512",   "transcript/sha3-512"]

@@ -32,7 +32,6 @@ use transcript::Transcript;
 use rayon::prelude::*;
 
 
-
 // ────────────────────────────────────────────────────────────────────────
 //  Hash helpers
 // ────────────────────────────────────────────────────────────────────────
@@ -840,10 +839,17 @@ pub fn fri_build_transcript<E: TowerField>(
         let cfg = MerkleChannelCfg::new(vec![arity; depth], ell as u64);
         let mut tree = MerkleTreeChannel::new(cfg, trace_hash);
 
-        for i in 0..cur_size {
-            let fields = ext_leaf_fields(cur_f[i], s[i], q[i]);
-            tree.push_leaf(&fields);
-        }
+        //for i in 0..cur_size {
+        //    let fields = ext_leaf_fields(cur_f[i], s[i], q[i]);
+        //    tree.push_leaf(&fields);
+        //}
+
+        // After (parallel):
+        let all_fields: Vec<Vec<F>> = (0..cur_size)
+            .map(|i| ext_leaf_fields(cur_f[i], s[i], q[i]))
+            .collect();
+        tree.push_leaves_parallel(&all_fields);
+        
         let layer_root = tree.finalize();
 
         layer_commitments.push(FriLayerCommitment {

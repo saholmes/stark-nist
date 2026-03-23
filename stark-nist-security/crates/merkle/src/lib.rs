@@ -4,10 +4,13 @@ use ark_goldilocks::Goldilocks;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-// ── Feature-gated hash import ──
 use hash::SelectedHasher;
 use hash::selected::HASH_BYTES;
 use hash::sha3::Digest;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 
 /// =======================
 /// Serialization helpers
@@ -126,7 +129,7 @@ impl MerkleChannelCfg {
 }
 
 /// =======================
-/// Merkle opening (HASH_BYTES-wide digests)
+/// Merkle opening
 /// =======================
 
 #[derive(Clone, Debug)]
@@ -137,7 +140,31 @@ pub struct MerkleOpening {
 }
 
 /// =======================
-/// Merkle tree (feature-gated hash)
+/// Free helper: hash a single leaf (no &self needed)
+/// =======================
+
+fn compress_leaf_standalone(
+    arity: usize,
+    tree_label: u64,
+    position: u64,
+    values: &[F],
+) -> [u8; HASH_BYTES] {
+    let ds = DsLabel {
+        arity,
+        level: LEAF_LEVEL_DS,
+        position,
+        tree_label,
+    };
+    let mut h = SelectedHasher::new();
+    Digest::update(&mut h, ds.to_bytes());
+    for v in values {
+        Digest::update(&mut h, field_to_bytes(v));
+    }
+    finalize_hash(h)
+}
+
+/// =======================
+/// Merkle tree
 /// =======================
 
 pub struct MerkleTreeChannel {
@@ -186,6 +213,37 @@ impl MerkleTreeChannel {
 
         let leaf = self.compress_leaf(ds, values);
         self.levels[0].push(leaf);
+    }
+
+    /// Bulk-insert all leaves, using rayon when `parallel` is enabled.
+    pub fn push_leaves_parallel(&mut self, all_values: &[Vec<F>]) {
+        if self.levels.is_empty() {
+            self.levels.push(Vec::new());
+        }
+
+        // Pull config out before the closure so we don't borrow &self inside par_iter
+        let arity = self.cfg.layer_arities[0];
+        let tree_label = self.cfg.tree_label;
+
+        #[cfg(feature = "parallel")]
+        let leaves: Vec<[u8; HASH_BYTES]> = all_values
+            .par_iter()
+            .enumerate()
+            .map(|(idx, values)| {
+                compress_leaf_standalone(arity, tree_label, idx as u64, values)
+            })
+            .collect();
+
+        #[cfg(not(feature = "parallel"))]
+        let leaves: Vec<[u8; HASH_BYTES]> = all_values
+            .iter()
+            .enumerate()
+            .map(|(idx, values)| {
+                compress_leaf_standalone(arity, tree_label, idx as u64, values)
+            })
+            .collect();
+
+        self.levels[0] = leaves;
     }
 
     pub fn finalize(&mut self) -> [u8; HASH_BYTES] {
@@ -307,19 +365,17 @@ impl MerkleTreeChannel {
 
         cur == root
     }
-}
+} // ← impl MerkleTreeChannel ends here
+
+/// =======================
+/// Free function: compute a single leaf hash
+/// =======================
 
 pub fn compute_leaf_hash(cfg: &MerkleChannelCfg, index: usize, values: &[F]) -> [u8; HASH_BYTES] {
-    let ds = DsLabel {
-        arity: cfg.layer_arities[0],
-        level: LEAF_LEVEL_DS,
-        position: index as u64,
-        tree_label: cfg.tree_label,
-    };
-    let mut h = SelectedHasher::new();
-    Digest::update(&mut h, ds.to_bytes());
-    for v in values {
-        Digest::update(&mut h, field_to_bytes(v));
-    }
-    finalize_hash(h)
+    compress_leaf_standalone(
+        cfg.layer_arities[0],
+        cfg.tree_label,
+        index as u64,
+        values,
+    )
 }
