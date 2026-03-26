@@ -37,7 +37,6 @@ use rayon::prelude::*;
 //  Hash helpers
 // ────────────────────────────────────────────────────────────────────────
 
-/// Finalize a hasher into a fixed-size digest array.
 #[inline]
 fn finalize_to_digest(h: SelectedHasher) -> [u8; HASH_BYTES] {
     let result = h.finalize();
@@ -46,9 +45,6 @@ fn finalize_to_digest(h: SelectedHasher) -> [u8; HASH_BYTES] {
     out
 }
 
-/// Squeeze HASH_BYTES from the Fiat–Shamir transcript.
-///
-/// Panics if the transcript's native digest is shorter than HASH_BYTES.
 fn transcript_challenge_hash(tr: &mut Transcript, label: &[u8]) -> [u8; HASH_BYTES] {
     let v = tr.challenge_bytes(label);
     assert!(
@@ -147,7 +143,6 @@ fn build_z_pows(z_l: F, m: usize) -> Vec<F> {
     z_pows
 }
 
-/// Build powers of an extension-field folding challenge.
 fn build_ext_pows<E: TowerField>(alpha: E, m: usize) -> Vec<E> {
     let mut pows = Vec::with_capacity(m);
     let mut acc = E::one();
@@ -162,8 +157,6 @@ fn eval_poly_at_ext<E: TowerField>(coeffs: &[F], z: E) -> E {
     E::eval_base_poly(coeffs, z)
 }
 
-/// DEEP quotient for a **base-field** codeword evaluated against z ∈ E.
-/// Used for layer 0, where the trace values are in F_p.
 fn compute_q_layer_ext<E: TowerField + Send + Sync>(
     f_l: &[F],
     z: E,
@@ -174,7 +167,6 @@ fn compute_q_layer_ext<E: TowerField + Send + Sync>(
     let coeffs = dom.ifft(f_l);
     let fz = eval_poly_at_ext(&coeffs, z);
 
-    // ── Precompute domain points sequentially (O(n) cheap muls) ──
     let omega_ext = E::from_fp(omega);
     let xs: Vec<E> = {
         let mut v = Vec::with_capacity(n);
@@ -186,7 +178,6 @@ fn compute_q_layer_ext<E: TowerField + Send + Sync>(
         v
     };
 
-    // ── Quotient: each ext_div is independent ──
     #[cfg(feature = "parallel")]
     let q: Vec<E> = f_l
         .par_iter()
@@ -225,7 +216,6 @@ fn compute_q_layer_ext_on_ext<E: TowerField + Send + Sync>(
     let d = E::DEGREE;
     let dom = Domain::<F>::new(n).unwrap();
 
-    // ── Transpose: extract per-component evaluation vectors ──
     let mut comp_evals: Vec<Vec<F>> = vec![Vec::with_capacity(n); d];
     for elem in f_l {
         let comps = elem.to_fp_components();
@@ -234,7 +224,6 @@ fn compute_q_layer_ext_on_ext<E: TowerField + Send + Sync>(
         }
     }
 
-    // ── IFFT across the d independent components ──
     #[cfg(feature = "parallel")]
     let comp_coeffs: Vec<Vec<F>> = comp_evals
         .par_iter()
@@ -247,7 +236,6 @@ fn compute_q_layer_ext_on_ext<E: TowerField + Send + Sync>(
         .map(|evals| dom.ifft(evals))
         .collect();
 
-    // ── Horner evaluation for f(z) — sequential (data-dependent) ──
     let mut fz = E::zero();
     for k in (0..n).rev() {
         let coeff_comps: Vec<F> = (0..d).map(|j| comp_coeffs[j][k]).collect();
@@ -256,7 +244,6 @@ fn compute_q_layer_ext_on_ext<E: TowerField + Send + Sync>(
         fz = fz * z + coeff_k;
     }
 
-    // ── Precompute domain points sequentially ──
     let omega_ext = E::from_fp(omega);
     let xs: Vec<E> = {
         let mut v = Vec::with_capacity(n);
@@ -268,7 +255,6 @@ fn compute_q_layer_ext_on_ext<E: TowerField + Send + Sync>(
         v
     };
 
-    // ── Quotient computation ──
     #[cfg(feature = "parallel")]
     let q: Vec<E> = f_l
         .par_iter()
@@ -361,6 +347,292 @@ fn compute_s_layer_ext<E: TowerField>(
 }
 
 // ────────────────────────────────────────────────────────────────────────
+//  Construction 5.1 — Coefficient extraction & interpolation fold
+// ────────────────────────────────────────────────────────────────────────
+
+/// Extract per-coset interpolation coefficients for an arity-m fold.
+///
+/// For each coset b = 0..n_next-1, the fibre is
+///   { evals[b + j * n_next] : j = 0..m-1 }
+/// evaluated at domain points
+///   x_j = ω^{b + j * n_next}.
+///
+/// Returns `n_next` tuples of `m` coefficients `[C_0(b), …, C_{m-1}(b)]`
+/// such that `Σ_i C_i(b) · x_j^i = evals[b + j * n_next]`.
+///
+/// By Lemma 1 of the paper, when `evals` is the evaluation of a
+/// polynomial of degree < d on D, each `C_i` lies in `RS[D', d/m]`.
+fn extract_all_coset_coefficients<E: TowerField>(
+    evals: &[E],
+    omega: F,
+    m: usize,
+) -> Vec<Vec<E>> {
+    let n = evals.len();
+    assert!(n % m == 0);
+    let n_next = n / m;
+    let zeta = omega.pow([n_next as u64]); // primitive m-th root of unity
+
+    (0..n_next)
+        .map(|b| {
+            let fibre_values: Vec<E> = (0..m)
+                .map(|j| evals[b + j * n_next])
+                .collect();
+            let omega_b = omega.pow([b as u64]);
+            interpolate_coset_ext(&fibre_values, omega_b, zeta, m)
+        })
+        .collect()
+}
+
+/// Solve the Vandermonde system for a single coset.
+///
+/// Given fibre values `v_j = f(ω^b · ζ^j)` for j=0..m-1
+/// (where ζ = ω^{n_next} is a primitive m-th root of unity),
+/// returns coefficients `c_i` such that `Σ_i c_i · (ω^b ζ^j)^i = v_j`.
+///
+/// Method: `d = IDFT_m(v)` using ζ, then `c_i = d_i · (ω^b)^{-i}`.
+fn interpolate_coset_ext<E: TowerField>(
+    fibre_values: &[E],
+    omega_b: F,
+    zeta: F,
+    m: usize,
+) -> Vec<E> {
+    let d = E::DEGREE;
+    let m_inv = F::from(m as u64).inverse().unwrap();
+    let zeta_inv = zeta.inverse().unwrap();
+
+    // Precompute ζ^{-k} for k = 0..m-1
+    let mut zi_pows = vec![F::one(); m];
+    for k in 1..m {
+        zi_pows[k] = zi_pows[k - 1] * zeta_inv;
+    }
+
+    // Component-wise IDFT: d_i = (1/m) Σ_j v_j · ζ^{-ij}
+    let mut comp_vecs: Vec<Vec<F>> = vec![Vec::with_capacity(m); d];
+    for val in fibre_values {
+        let comps = val.to_fp_components();
+        for c in 0..d {
+            comp_vecs[c].push(comps[c]);
+        }
+    }
+
+    let mut comp_d: Vec<Vec<F>> = vec![vec![F::zero(); m]; d];
+    for c in 0..d {
+        for i in 0..m {
+            let mut sum = F::zero();
+            for j in 0..m {
+                let exp = (i * j) % m;
+                sum += comp_vecs[c][j] * zi_pows[exp];
+            }
+            comp_d[c][i] = sum * m_inv;
+        }
+    }
+
+    // c_i = d_i · (ω^b)^{-i}
+    let omega_b_inv = if omega_b == F::zero() {
+        F::one()
+    } else {
+        omega_b.inverse().unwrap()
+    };
+
+    let mut result = Vec::with_capacity(m);
+    let mut ob_inv_pow = F::one(); // (ω^b)^{-0} = 1
+    for i in 0..m {
+        let comps: Vec<F> = (0..d).map(|c| comp_d[c][i]).collect();
+        let di = E::from_fp_components(&comps).unwrap();
+        result.push(di * E::from_fp(ob_inv_pow));
+        ob_inv_pow *= omega_b_inv;
+    }
+
+    result
+}
+
+/// Fold using per-coset interpolation coefficients.
+///
+/// Computes `P_z(α) = Σ_i C_i(z) · α^i` for each coset z.
+fn interpolation_fold_ext<E: TowerField>(
+    coeff_tuples: &[Vec<E>],
+    alpha: E,
+) -> Vec<E> {
+    let m = coeff_tuples[0].len();
+    let alpha_pows = build_ext_pows(alpha, m);
+
+    coeff_tuples
+        .iter()
+        .map(|coeffs| {
+            let mut sum = E::zero();
+            for i in 0..m {
+                sum = sum + coeffs[i] * alpha_pows[i];
+            }
+            sum
+        })
+        .collect()
+}
+
+/// Compute the s-layer using interpolation coefficients.
+///
+/// For each position in the original domain, stores the fold value
+/// of the coset it belongs to (matching `compute_s_layer_ext` semantics
+/// but using the interpolation-based fold formula).
+fn compute_s_layer_from_coeffs<E: TowerField>(
+    coeff_tuples: &[Vec<E>],
+    alpha: E,
+    n: usize,
+    m: usize,
+) -> Vec<E> {
+    let n_next = n / m;
+    let folded = interpolation_fold_ext(coeff_tuples, alpha);
+
+    let mut s_per_i = vec![E::zero(); n];
+    for b in 0..n_next {
+        for j in 0..m {
+            s_per_i[b + j * n_next] = folded[b];
+        }
+    }
+    s_per_i
+}
+
+/// Verify interpolation consistency at a single coset.
+///
+/// Checks that `Σ_i C_i · x_j^i == f(x_j)` for every fibre point x_j.
+fn verify_interpolation_consistency<E: TowerField>(
+    fibre_values: &[E],
+    fibre_points: &[F],
+    coeff_tuple: &[E],
+) -> bool {
+    let m = fibre_values.len();
+    for j in 0..m {
+        let mut eval = E::zero();
+        let mut x_pow = F::one();
+        for i in 0..m {
+            eval = eval + coeff_tuple[i] * E::from_fp(x_pow);
+            x_pow *= fibre_points[j];
+        }
+        if eval != fibre_values[j] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Batched degree check for coefficient functions.
+///
+/// Computes `Γ(z) = Σ_i β^i C_i(z)` for all z ∈ D_L and verifies
+/// `deg(Γ) < d_final` by IFFT + high-coefficient zero-check.
+fn batched_degree_check_ext<E: TowerField>(
+    coeff_tuples: &[Vec<E>],
+    beta: E,
+    d_final: usize,
+) -> bool {
+    let n_final = coeff_tuples.len();
+    if n_final == 0 {
+        return true;
+    }
+    let m = coeff_tuples[0].len();
+    let beta_pows = build_ext_pows(beta, m);
+
+    // Compute Γ(z_b) for each z_b
+    let gamma_evals: Vec<E> = (0..n_final)
+        .map(|b| {
+            let mut sum = E::zero();
+            for i in 0..m {
+                sum = sum + coeff_tuples[b][i] * beta_pows[i];
+            }
+            sum
+        })
+        .collect();
+
+    // Component-wise IFFT to get polynomial coefficients
+    let deg = E::DEGREE;
+    let dom = Domain::<F>::new(n_final).unwrap();
+
+    let mut comp_evals: Vec<Vec<F>> = vec![Vec::with_capacity(n_final); deg];
+    for elem in &gamma_evals {
+        let comps = elem.to_fp_components();
+        for j in 0..deg {
+            comp_evals[j].push(comps[j]);
+        }
+    }
+
+    let comp_coeffs: Vec<Vec<F>> = comp_evals
+        .iter()
+        .map(|evals| dom.ifft(evals))
+        .collect();
+
+    // Check all coefficients of degree ≥ d_final are zero
+    for k in d_final..n_final {
+        for j in 0..deg {
+            if !comp_coeffs[j][k].is_zero() {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Merkle tree configuration for the coefficient commitment.
+fn coeff_tree_config(n_final: usize) -> MerkleChannelCfg {
+    let arity = pick_arity_for_layer(n_final, 16).max(2);
+    let depth = merkle_depth(n_final, arity);
+    MerkleChannelCfg::new(vec![arity; depth], 0xFE)
+}
+
+/// Serialize a coefficient tuple as base-field elements for Merkle hashing.
+fn coeff_leaf_fields<E: TowerField>(tuple: &[E]) -> Vec<F> {
+    tuple.iter().flat_map(|e| e.to_fp_components()).collect()
+}
+
+// ────────────────────────────────────────────────────────────────────────
+//  Extension-field evaluation/coefficient helpers
+// ────────────────────────────────────────────────────────────────────────
+
+/// Component-wise IFFT: convert extension-field evaluations over a
+/// radix-2 domain into polynomial coefficients.
+fn ext_evals_to_coeffs<E: TowerField>(evals: &[E]) -> Vec<E> {
+    let n = evals.len();
+    if n == 0 {
+        return vec![];
+    }
+    if n == 1 {
+        return evals.to_vec();
+    }
+
+    let d = E::DEGREE;
+    let dom = Domain::<F>::new(n).unwrap();
+
+    let mut comp_evals: Vec<Vec<F>> = vec![Vec::with_capacity(n); d];
+    for elem in evals {
+        let comps = elem.to_fp_components();
+        for j in 0..d {
+            comp_evals[j].push(comps[j]);
+        }
+    }
+
+    let comp_coeffs: Vec<Vec<F>> = comp_evals
+        .iter()
+        .map(|e| dom.ifft(e))
+        .collect();
+
+    (0..n)
+        .map(|k| {
+            let comps: Vec<F> = (0..d).map(|j| comp_coeffs[j][k]).collect();
+            E::from_fp_components(&comps).unwrap()
+        })
+        .collect()
+}
+
+/// Evaluate a polynomial (given by extension-field coefficients) at an
+/// extension-field point using Horner's method.  O(coeffs.len()).
+#[inline]
+fn eval_final_poly_ext<E: TowerField>(coeffs: &[E], x: E) -> E {
+    let mut result = E::zero();
+    for c in coeffs.iter().rev() {
+        result = result * x + *c;
+    }
+    result
+}
+
+// ────────────────────────────────────────────────────────────────────────
 //  Base-field FRI fold (kept for backward compatibility / tests)
 // ────────────────────────────────────────────────────────────────────────
 
@@ -423,7 +695,6 @@ pub fn fri_sample_z_ell(seed_z: u64, level: usize, domain_size: usize) -> F {
         ds::FRI_Z_L,
         &[F::from(seed_z), F::from(level as u64), F::from(domain_size as u64)],
     );
-    // StdRng always requires a 32-byte seed — independent of digest size
     let mut seed_bytes = [0u8; 32];
     fused.serialize_uncompressed(&mut seed_bytes[..]).expect("serialize");
     let mut rng = StdRng::from_seed(seed_bytes);
@@ -446,7 +717,6 @@ pub fn fri_sample_z_ell(seed_z: u64, level: usize, domain_size: usize) -> F {
     }
 }
 
-/// Base-field s-layer (kept for backward compatibility / tests).
 pub fn compute_s_layer(f_l: &[F], z_l: F, m: usize) -> Vec<F> {
     let n = f_l.len();
     assert!(n % m == 0);
@@ -493,7 +763,6 @@ fn hash_node(children: &[[u8; HASH_BYTES]]) -> [u8; HASH_BYTES] {
 fn index_from_seed(seed_f: F, n_pow2: usize) -> usize {
     assert!(n_pow2.is_power_of_two());
     let mask = n_pow2 - 1;
-    // StdRng always requires a 32-byte seed — independent of digest size
     let mut seed_bytes = [0u8; 32];
     seed_f.serialize_uncompressed(&mut seed_bytes[..]).unwrap();
     let mut rng = StdRng::from_seed(seed_bytes);
@@ -532,14 +801,12 @@ fn pick_arity_for_layer(n: usize, requested_m: usize) -> usize {
     1
 }
 
-/// Bind the public statement — including the extension degree — into the
-/// Fiat–Shamir transcript.  This prevents cross-field replays: a proof
-/// generated with F_{p^3} challenges cannot verify with F_{p^2}.
 fn bind_statement_to_transcript<E: TowerField>(
     tr: &mut Transcript,
     schedule: &[usize],
     n0: usize,
     seed_z: u64,
+    coeff_commit_final: bool,
 ) {
     tr.absorb_bytes(b"DEEP-FRI-STATEMENT");
     tr.absorb_field(F::from(n0 as u64));
@@ -548,11 +815,11 @@ fn bind_statement_to_transcript<E: TowerField>(
         tr.absorb_field(F::from(m as u64));
     }
     tr.absorb_field(F::from(seed_z));
-    // Extension-field degree binding (prevents cross-tower replay)
     tr.absorb_field(F::from(E::DEGREE as u64));
+    // Bind the protocol variant so transcripts are domain-separated
+    tr.absorb_field(F::from(coeff_commit_final as u64));
 }
 
-/// Base-field FRI fold (kept for backward compatibility / tests).
 pub fn fri_fold_layer(
     evals: &[F],
     z_l: F,
@@ -626,38 +893,34 @@ pub struct FriTranscript {
 pub struct FriProverParams {
     pub schedule: Vec<usize>,
     pub seed_z: u64,
+    pub coeff_commit_final: bool,
+    pub d_final: usize,
 }
 
 /// Prover state after transcript construction.
-///
-/// All codeword layers are stored uniformly in E.  Layer 0 values
-/// are embedded from the base field via `E::from_fp`.  After folding
-/// with α₀ ∈ E, all subsequent layers are genuine extension-field
-/// elements, giving Schwartz–Zippel exception probability L_ℓ/|E|
-/// per layer.
 pub struct FriProverState<E: TowerField> {
-    /// Original base-field trace (for the f₀ Merkle tree).
     pub f0_base: Vec<F>,
-    /// Codeword at each layer, uniformly in E.
     pub f_layers_ext: Vec<Vec<E>>,
-    /// Per-position repeated fold targets in E.
     pub s_layers: Vec<Vec<E>>,
-    /// DEEP quotients in E.
     pub q_layers: Vec<Vec<E>>,
-    /// f_ℓ(z) at each layer, in E.
     pub fz_layers: Vec<E>,
     pub transcript: FriTranscript,
-    /// Domain generators (base field).
     pub omega_layers: Vec<F>,
-    /// DEEP challenge point z ∈ E.
     pub z_ext: E,
-    /// Folding challenges α_ℓ ∈ E.
     pub alpha_layers: Vec<E>,
     pub root_f0: [u8; HASH_BYTES],
     pub trace_hash: [u8; HASH_BYTES],
-    /// The seed_z used when building the f₀ Merkle tree, so that
-    /// `fri_prove_queries` can reconstruct the same tree.
     pub seed_z: u64,
+    /// Construction 5.1: per-coset interpolation coefficient tuples.
+    pub coeff_tuples: Option<Vec<Vec<E>>>,
+    /// Construction 5.1: Merkle root of the coefficient tree.
+    pub coeff_root: Option<[u8; HASH_BYTES]>,
+    /// Construction 5.1: batched degree-check challenge.
+    pub beta_deg: Option<E>,
+    /// Whether Construction 5.1 is active.
+    pub coeff_commit_final: bool,
+    /// Degree bound for the final layer (each C_i should have degree < d_final).
+    pub d_final: usize,
 }
 
 #[derive(Clone)]
@@ -668,15 +931,12 @@ pub struct LayerQueryRef {
     pub parent_pos: usize,
 }
 
-/// Per-query index path through the folding layers.
-/// No longer generic — it carries only indices, not field values.
 #[derive(Clone)]
 pub struct FriQueryOpenings {
     pub per_layer_refs: Vec<LayerQueryRef>,
     pub final_index: usize,
 }
 
-/// Per-layer opened values — all in E.
 #[derive(Clone)]
 pub struct LayerOpenPayload<E: TowerField> {
     pub f_val: E,
@@ -690,6 +950,10 @@ pub struct FriQueryPayload<E: TowerField> {
     pub per_layer_payloads: Vec<LayerOpenPayload<E>>,
     pub f0_opening: MerkleOpening,
     pub final_index: usize,
+    // NOTE: No final_fibre field.  Under Construction 5.1 the
+    // coefficient tuples are sent in the clear and the verifier
+    // checks single-point consistency using the already-opened
+    // f^{(L-1)} value (Theorem 4, revised).
 }
 
 #[derive(Clone)]
@@ -708,10 +972,15 @@ pub struct DeepFriProof<E: TowerField> {
     pub f0_openings: Vec<MerkleOpening>,
     pub queries: Vec<FriQueryPayload<E>>,
     pub fz_per_layer: Vec<E>,
-    /// The entire final-layer codeword, committed before query derivation.
-    pub final_codeword: Vec<E>,
+    /// Coefficients of the final polynomial (degree < d_final).
+    /// Replaces the old full `final_codeword` to keep the verifier O(r).
+    pub final_poly_coeffs: Vec<E>,
     pub n0: usize,
     pub omega0: F,
+    /// Construction 5.1: all per-coset coefficient tuples (sent in the clear).
+    pub coeff_tuples: Option<Vec<Vec<E>>>,
+    /// Construction 5.1: Merkle root of the coefficient tree.
+    pub coeff_root: Option<[u8; HASH_BYTES]>,
 }
 
 #[derive(Clone, Debug)]
@@ -719,13 +988,41 @@ pub struct DeepFriParams {
     pub schedule: Vec<usize>,
     pub r: usize,
     pub seed_z: u64,
+    /// Enable Construction 5.1 (coefficient-committed final round).
+    pub coeff_commit_final: bool,
+    /// Degree bound for the final polynomial. Default 1 (constant).
+    pub d_final: usize,
+}
+
+impl DeepFriParams {
+    /// Create params with the original protocol (no coefficient commitment).
+    pub fn new(schedule: Vec<usize>, r: usize, seed_z: u64) -> Self {
+        Self {
+            schedule,
+            r,
+            seed_z,
+            coeff_commit_final: false,
+            d_final: 1,
+        }
+    }
+
+    /// Enable Construction 5.1.
+    pub fn with_coeff_commit(mut self) -> Self {
+        self.coeff_commit_final = true;
+        self
+    }
+
+    /// Set the final degree bound.
+    pub fn with_d_final(mut self, d: usize) -> Self {
+        self.d_final = d;
+        self
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  Leaf serialization helpers — generic over E
+//  Leaf serialization helpers
 // ────────────────────────────────────────────────────────────────────────
 
-/// Serialize a combined (f, s, q) leaf as 3·E::DEGREE base-field elements.
 #[inline]
 fn ext_leaf_fields<E: TowerField>(f: E, s: E, q: E) -> Vec<F> {
     let mut fields = f.to_fp_components();
@@ -735,10 +1032,9 @@ fn ext_leaf_fields<E: TowerField>(f: E, s: E, q: E) -> Vec<F> {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-//  Derive an extension-field challenge from the Fiat–Shamir transcript
+//  Extension-field challenge helpers
 // ────────────────────────────────────────────────────────────────────────
 
-/// Squeeze E::DEGREE base-field challenges and combine into one E element.
 fn challenge_ext<E: TowerField>(tr: &mut Transcript, tag: &[u8]) -> E {
     let d = E::DEGREE;
     let mut components = Vec::with_capacity(d);
@@ -755,8 +1051,6 @@ fn challenge_ext<E: TowerField>(tr: &mut Transcript, tag: &[u8]) -> E {
         .expect("challenge_ext: failed to build extension element from squeezed components")
 }
 
-/// Absorb all E::DEGREE base-field coordinates of an extension element
-/// into the transcript.
 fn absorb_ext<E: TowerField>(tr: &mut Transcript, v: E) {
     for c in v.to_fp_components() {
         tr.absorb_field(c);
@@ -774,10 +1068,18 @@ pub fn fri_build_transcript<E: TowerField>(
 ) -> FriProverState<E> {
     let schedule = params.schedule.clone();
     let l = schedule.len();
+    let use_coeff_commit = params.coeff_commit_final && l > 0;
+    let normal_layers = if use_coeff_commit { l - 1 } else { l };
 
     // ── Phase 0: Statement binding ──
     let mut tr = Transcript::new_matching_hash(b"FRI/FS");
-    bind_statement_to_transcript::<E>(&mut tr, &schedule, domain0.size, params.seed_z);
+    bind_statement_to_transcript::<E>(
+        &mut tr,
+        &schedule,
+        domain0.size,
+        params.seed_z,
+        params.coeff_commit_final,
+    );
 
     // ── Phase 1: Commit f₀ (base-field trace) ──
     let f0_th = f0_trace_hash(domain0.size, params.seed_z);
@@ -788,20 +1090,16 @@ pub fn fri_build_transcript<E: TowerField>(
     }
     let root_f0 = f0_tree.finalize();
 
-    // Absorb root_f0 so that z depends on the committed trace
     tr.absorb_bytes(&root_f0);
 
     // ── Phase 2: DEEP challenge z ∈ E ──
     let z_ext = challenge_ext::<E>(&mut tr, b"z_fp3");
 
-    // Derive trace_hash for layer trees
     let trace_hash: [u8; HASH_BYTES] = transcript_challenge_hash(&mut tr, ds::FRI_SEED);
 
-    // ── Phase 3: Layer-by-layer with E folding challenges ──
+    // ── Phase 3: Layer-by-layer ──
 
-    let f0_ext: Vec<E> = f0.iter()
-        .map(|&x| E::from_fp(x))
-        .collect();
+    let f0_ext: Vec<E> = f0.iter().map(|&x| E::from_fp(x)).collect();
 
     let mut f_layers_ext: Vec<Vec<E>> = Vec::with_capacity(l + 1);
     let mut s_layers: Vec<Vec<E>> = Vec::with_capacity(l + 1);
@@ -814,35 +1112,31 @@ pub fn fri_build_transcript<E: TowerField>(
     f_layers_ext.push(f0_ext);
     let mut cur_size = domain0.size;
 
-    for ell in 0..l {
+    // ── Normal (intermediate) layers: 0 .. normal_layers-1 ──
+    for ell in 0..normal_layers {
         let m = schedule[ell];
 
-        // ── Folding challenge α_ℓ ∈ E ──
         let alpha_ell = challenge_ext::<E>(&mut tr, b"alpha");
         alpha_layers.push(alpha_ell);
 
-        // Domain generator for this layer
         let dom = Domain::<F>::new(cur_size).unwrap();
         let omega = dom.group_gen;
         omega_layers.push(omega);
 
-        // ── DEEP quotient ──
         let cur_f = &f_layers_ext[ell];
         let (q, fz) = compute_q_layer_ext_on_ext(cur_f, z_ext, omega);
         q_layers.push(q.clone());
         fz_layers.push(fz);
 
-        // ── Fold targets (s-layer) ──
         let s = compute_s_layer_ext(cur_f, alpha_ell, m);
         s_layers.push(s.clone());
 
-        // ── Merkle commitment for this layer ──
+        // Merkle commitment
         let arity = pick_arity_for_layer(cur_size, m).max(2);
         let depth = merkle_depth(cur_size, arity);
         let cfg = MerkleChannelCfg::new(vec![arity; depth], ell as u64);
         let mut tree = MerkleTreeChannel::new(cfg, trace_hash);
 
-        // After (parallel):
         let all_fields: Vec<Vec<F>> = (0..cur_size)
             .map(|i| ext_leaf_fields(cur_f[i], s[i], q[i]))
             .collect();
@@ -856,11 +1150,9 @@ pub fn fri_build_transcript<E: TowerField>(
             root: layer_root,
         });
 
-        // ── Absorb f_ℓ(z) and layer root ──
         absorb_ext(&mut tr, fz);
         tr.absorb_bytes(&layer_root);
 
-        // ── Fold to next layer using α_ℓ ∈ E ──
         let next_f = fri_fold_layer_ext_impl(cur_f, alpha_ell, m);
         cur_size /= m;
         f_layers_ext.push(next_f);
@@ -871,7 +1163,96 @@ pub fn fri_build_transcript<E: TowerField>(
         );
     }
 
-    // Dummy s-layer for the final layer
+    // ── Construction 5.1: coefficient-committed final layer ──
+    let mut stored_coeff_tuples: Option<Vec<Vec<E>>> = None;
+    let mut stored_coeff_root: Option<[u8; HASH_BYTES]> = None;
+    let mut stored_beta: Option<E> = None;
+
+    if use_coeff_commit {
+        let ell = l - 1;
+        let m = schedule[ell];
+
+        let dom = Domain::<F>::new(cur_size).unwrap();
+        let omega = dom.group_gen;
+        omega_layers.push(omega);
+
+        let cur_f = &f_layers_ext[ell];
+
+        // DEEP quotient (does not need α)
+        let (q, fz) = compute_q_layer_ext_on_ext(cur_f, z_ext, omega);
+        q_layers.push(q.clone());
+        fz_layers.push(fz);
+
+        // s-layer: zeros (unused under Construction 5.1, but we still
+        // need to store *something* for the Merkle leaf format)
+        let s = vec![E::zero(); cur_size];
+        s_layers.push(s.clone());
+
+        // Commit (f, 0, q) in the layer tree
+        let arity = pick_arity_for_layer(cur_size, m).max(2);
+        let depth = merkle_depth(cur_size, arity);
+        let cfg = MerkleChannelCfg::new(vec![arity; depth], ell as u64);
+        let mut tree = MerkleTreeChannel::new(cfg, trace_hash);
+
+        let all_fields: Vec<Vec<F>> = (0..cur_size)
+            .map(|i| ext_leaf_fields(cur_f[i], s[i], q[i]))
+            .collect();
+        tree.push_leaves_parallel(&all_fields);
+
+        let layer_root = tree.finalize();
+
+        layer_commitments.push(FriLayerCommitment {
+            n: cur_size,
+            m,
+            root: layer_root,
+        });
+
+        // Absorb fz and layer root BEFORE the coefficient commitment
+        absorb_ext(&mut tr, fz);
+        tr.absorb_bytes(&layer_root);
+
+        // ── Extract per-coset interpolation coefficients ──
+        let coeff_tuples = extract_all_coset_coefficients(cur_f, omega, m);
+
+        // ── Commit coefficient tree ──
+        let n_final = cur_size / m;
+        let coeff_cfg = coeff_tree_config(n_final);
+        let mut coeff_tree = MerkleTreeChannel::new(coeff_cfg, trace_hash);
+
+        let coeff_fields: Vec<Vec<F>> = coeff_tuples
+            .iter()
+            .map(|t| coeff_leaf_fields(t))
+            .collect();
+        coeff_tree.push_leaves_parallel(&coeff_fields);
+
+        let coeff_root = coeff_tree.finalize();
+
+        // Absorb coefficient root (before deriving α)
+        tr.absorb_bytes(&coeff_root);
+
+        // NOW derive the final folding challenge α_{L-1}
+        let alpha_ell = challenge_ext::<E>(&mut tr, b"alpha");
+        alpha_layers.push(alpha_ell);
+
+        // Derive β for the batched degree check
+        let beta_deg = challenge_ext::<E>(&mut tr, b"beta_deg");
+
+        // Fold using interpolation coefficients
+        let next_f = interpolation_fold_ext(&coeff_tuples, alpha_ell);
+        cur_size = n_final;
+        f_layers_ext.push(next_f);
+
+        stored_coeff_tuples = Some(coeff_tuples);
+        stored_coeff_root = Some(coeff_root);
+        stored_beta = Some(beta_deg);
+
+        logln!(
+            "[PROVER][COEFF-COMMIT] ell={} coeff_root={:?}",
+            ell, coeff_root
+        );
+    }
+
+    // Dummy s-layer for the final codeword layer
     s_layers.push(vec![E::zero(); f_layers_ext.last().unwrap().len()]);
 
     FriProverState {
@@ -890,6 +1271,11 @@ pub fn fri_build_transcript<E: TowerField>(
         root_f0,
         trace_hash,
         seed_z: params.seed_z,
+        coeff_tuples: stored_coeff_tuples,
+        coeff_root: stored_coeff_root,
+        beta_deg: stored_beta,
+        coeff_commit_final: use_coeff_commit,
+        d_final: params.d_final,
     }
 }
 
@@ -938,7 +1324,7 @@ pub fn fri_prove_queries<E: TowerField>(
         });
     }
 
-    // ── Rebuild f₀ Merkle tree (base-field trace) ──
+    // ── Rebuild f₀ Merkle tree ──
     let f0_th = f0_trace_hash(n0, st.seed_z);
     let f0_cfg = f0_tree_config(n0);
     let mut f0_tree = MerkleTreeChannel::new(f0_cfg, f0_th);
@@ -998,15 +1384,38 @@ pub fn deep_fri_prove<E: TowerField>(
     let prover_params = FriProverParams {
         schedule: params.schedule.clone(),
         seed_z: params.seed_z,
+        coeff_commit_final: params.coeff_commit_final,
+        d_final: params.d_final,
     };
 
     let st: FriProverState<E> = fri_build_transcript(f0, domain0, &prover_params);
 
     let L = params.schedule.len();
-    let final_codeword = st.f_layers_ext[L].clone();
+    let final_evals = st.f_layers_ext[L].clone();
 
-    // Derive query_seed by replaying the transcript, now absorbing
-    // the final codeword before squeezing query_seed.
+    // ── Extract final polynomial coefficients via component-wise IFFT ──
+    let final_poly_coeffs: Vec<E> = {
+        let all_coeffs = ext_evals_to_coeffs::<E>(&final_evals);
+        let d_final = params.d_final.min(all_coeffs.len());
+
+        // Warn (debug only) if high coefficients are non-zero
+        if cfg!(debug_assertions) {
+            for k in d_final..all_coeffs.len() {
+                if all_coeffs[k] != E::zero() {
+                    eprintln!(
+                        "[WARN] Final polynomial coefficient at degree {} is non-zero; \
+                         proof may not verify (d_final={})",
+                        k, params.d_final,
+                    );
+                    break;
+                }
+            }
+        }
+
+        all_coeffs[..d_final].to_vec()
+    };
+
+    // ── Replay the transcript to derive query_seed ──
     let query_seed = {
         let mut tr = Transcript::new_matching_hash(b"FRI/FS");
         bind_statement_to_transcript::<E>(
@@ -1014,25 +1423,42 @@ pub fn deep_fri_prove<E: TowerField>(
             &params.schedule,
             domain0.size,
             params.seed_z,
+            params.coeff_commit_final,
         );
         tr.absorb_bytes(&st.root_f0);
 
-        // Re-derive z
         let _ = challenge_ext::<E>(&mut tr, b"z_fp3");
-
-        // Re-derive trace_hash
         let _: [u8; HASH_BYTES] = transcript_challenge_hash(&mut tr, ds::FRI_SEED);
 
-        // Replay per-layer: α_ℓ (E::DEGREE squeezes), then absorb fz_ℓ + root_ℓ
-        for ell in 0..params.schedule.len() {
+        let use_coeff_commit = params.coeff_commit_final && L > 0;
+        let normal_layers = if use_coeff_commit { L - 1 } else { L };
+
+        // Replay intermediate layers
+        for ell in 0..normal_layers {
             let _ = challenge_ext::<E>(&mut tr, b"alpha");
             absorb_ext(&mut tr, st.fz_layers[ell]);
             tr.absorb_bytes(&st.transcript.layers[ell].root);
         }
 
-        // ── Absorb entire final codeword before query derivation ──
-        for &val in &final_codeword {
-            absorb_ext::<E>(&mut tr, val);
+        // Replay Construction 5.1 final layer
+        if use_coeff_commit {
+            let ell = L - 1;
+            // fz and layer root were absorbed before coeff root
+            absorb_ext(&mut tr, st.fz_layers[ell]);
+            tr.absorb_bytes(&st.transcript.layers[ell].root);
+
+            // coefficient root
+            tr.absorb_bytes(&st.coeff_root.unwrap());
+
+            // alpha (derived after coeff root)
+            let _ = challenge_ext::<E>(&mut tr, b"alpha");
+            // beta
+            let _ = challenge_ext::<E>(&mut tr, b"beta_deg");
+        }
+
+        // Absorb only the d_final polynomial coefficients (NOT the full codeword)
+        for &c in &final_poly_coeffs {
+            absorb_ext::<E>(&mut tr, c);
         }
 
         tr.challenge(b"query_seed")
@@ -1040,6 +1466,12 @@ pub fn deep_fri_prove<E: TowerField>(
 
     let (query_refs, roots, layer_proofs, f0_openings) =
         fri_prove_queries(&st, params.r, query_seed);
+
+    // ── Build per-query payloads ──
+    // Under Construction 5.1 the coefficient tuples are sent in the clear;
+    // the verifier checks single-point consistency using the already-opened
+    // f^{(L-1)} value at each query position (Theorem 4, revised).
+    // No additional fibre openings are required.
 
     let mut queries = Vec::with_capacity(params.r);
 
@@ -1069,36 +1501,32 @@ pub fn deep_fri_prove<E: TowerField>(
         f0_openings: queries.iter().map(|q| q.f0_opening.clone()).collect(),
         queries,
         fz_per_layer: st.fz_layers.clone(),
-        final_codeword,
+        final_poly_coeffs,
         n0: domain0.size,
         omega0: domain0.omega,
+        coeff_tuples: st.coeff_tuples.clone(),
+        coeff_root: st.coeff_root,
     }
 }
 
 pub fn deep_fri_proof_size_bytes<E: TowerField>(proof: &DeepFriProof<E>) -> usize {
     const FIELD_BYTES: usize = 8;
     let ext_bytes: usize = E::DEGREE * FIELD_BYTES;
-    // HASH_BYTES is the module-level feature-gated constant — no local override
     const INDEX_BYTES: usize = 8;
 
     let mut bytes = 0usize;
 
-    // root_f0 + layer roots
     bytes += HASH_BYTES;
     bytes += proof.roots.len() * HASH_BYTES;
 
-    // fz_per_layer (one E per layer)
     bytes += proof.fz_per_layer.len() * ext_bytes;
 
-    // Final codeword (sent in the clear)
-    bytes += proof.final_codeword.len() * ext_bytes;
+    bytes += proof.final_poly_coeffs.len() * ext_bytes;
 
-    // Query payloads: 3 E per layer
     for q in &proof.queries {
         bytes += q.per_layer_payloads.len() * 3 * ext_bytes;
     }
 
-    // f₀ Merkle openings
     for opening in &proof.f0_openings {
         bytes += HASH_BYTES;
         bytes += INDEX_BYTES;
@@ -1107,7 +1535,6 @@ pub fn deep_fri_proof_size_bytes<E: TowerField>(proof: &DeepFriProof<E>) -> usiz
         }
     }
 
-    // Layer Merkle openings
     for layer in &proof.layer_proofs.layers {
         for opening in &layer.openings {
             bytes += HASH_BYTES;
@@ -1116,6 +1543,16 @@ pub fn deep_fri_proof_size_bytes<E: TowerField>(proof: &DeepFriProof<E>) -> usiz
                 bytes += level.len() * HASH_BYTES;
             }
         }
+    }
+
+    // Coefficient tuples (Construction 5.1) — sent in the clear once
+    if let Some(ref tuples) = proof.coeff_tuples {
+        for t in tuples {
+            bytes += t.len() * ext_bytes;
+        }
+    }
+    if proof.coeff_root.is_some() {
+        bytes += HASH_BYTES;
     }
 
     bytes
@@ -1131,21 +1568,30 @@ pub fn deep_fri_verify<E: TowerField>(
 ) -> bool {
     let L = params.schedule.len();
     let sizes = layer_sizes_from_schedule(proof.n0, &params.schedule);
+    let use_coeff_commit = params.coeff_commit_final && L > 0;
+    let normal_layers = if use_coeff_commit { L - 1 } else { L };
 
     // ── Reconstruct the Fiat–Shamir transcript ──
     let mut tr = Transcript::new_matching_hash(b"FRI/FS");
-    bind_statement_to_transcript::<E>(&mut tr, &params.schedule, proof.n0, params.seed_z);
+    bind_statement_to_transcript::<E>(
+        &mut tr,
+        &params.schedule,
+        proof.n0,
+        params.seed_z,
+        params.coeff_commit_final,
+    );
     tr.absorb_bytes(&proof.root_f0);
 
     let z_ext = challenge_ext::<E>(&mut tr, b"z_fp3");
-
     let trace_hash: [u8; HASH_BYTES] = transcript_challenge_hash(&mut tr, ds::FRI_SEED);
 
     logln!("[VERIFY] z_ext = {:?}", z_ext);
 
-    // Derive per-layer fold challenges in E
+    // ── Derive per-layer fold challenges ──
     let mut alpha_layers: Vec<E> = Vec::with_capacity(L);
-    for ell in 0..L {
+
+    // Intermediate layers
+    for ell in 0..normal_layers {
         let alpha_ell = challenge_ext::<E>(&mut tr, b"alpha");
         alpha_layers.push(alpha_ell);
 
@@ -1157,37 +1603,119 @@ pub fn deep_fri_verify<E: TowerField>(
         }
     }
 
-    // ── Absorb entire final codeword before query derivation ──
-    for &val in &proof.final_codeword {
-        absorb_ext::<E>(&mut tr, val);
+    // Construction 5.1: final layer has different transcript ordering
+    let mut beta_deg: Option<E> = None;
+
+    if use_coeff_commit {
+        let ell = L - 1;
+
+        // Absorb fz and layer root BEFORE coeff root
+        if ell < proof.fz_per_layer.len() {
+            absorb_ext(&mut tr, proof.fz_per_layer[ell]);
+        }
+        if ell < proof.roots.len() {
+            tr.absorb_bytes(&proof.roots[ell]);
+        }
+
+        // Absorb coefficient root
+        match proof.coeff_root {
+            Some(ref cr) => tr.absorb_bytes(cr),
+            None => {
+                eprintln!("[FAIL][COEFF ROOT MISSING]");
+                return false;
+            }
+        }
+
+        // Derive alpha AFTER coeff root
+        let alpha_ell = challenge_ext::<E>(&mut tr, b"alpha");
+        alpha_layers.push(alpha_ell);
+
+        // Derive beta for degree check
+        let beta = challenge_ext::<E>(&mut tr, b"beta_deg");
+        beta_deg = Some(beta);
+    }
+
+    // Absorb only the d_final polynomial coefficients (NOT the full codeword)
+    for &c in &proof.final_poly_coeffs {
+        absorb_ext::<E>(&mut tr, c);
     }
 
     let query_seed: F = tr.challenge(b"query_seed");
 
-    // ── Global constancy check on the committed final codeword ──
-    if proof.final_codeword.is_empty() {
-        eprintln!("[FAIL][FINAL CODEWORD EMPTY]");
-        return false;
-    }
-    let expected_final_size = sizes[L];
-    if proof.final_codeword.len() != expected_final_size {
+    // ── Final polynomial coefficient count check ──
+    if proof.final_poly_coeffs.len() != params.d_final {
         eprintln!(
-            "[FAIL][FINAL CODEWORD SIZE] expected={} got={}",
-            expected_final_size,
-            proof.final_codeword.len()
+            "[FAIL][FINAL POLY COEFFS SIZE] expected={} got={}",
+            params.d_final,
+            proof.final_poly_coeffs.len()
         );
         return false;
     }
-    let final_const = proof.final_codeword[0];
-    for (idx, &val) in proof.final_codeword.iter().enumerate().skip(1) {
-        if val != final_const {
+
+    // ── Construction 5.1: coefficient commitment verification ──
+    if use_coeff_commit {
+        let coeff_tuples = match proof.coeff_tuples {
+            Some(ref ct) => ct,
+            None => {
+                eprintln!("[FAIL][COEFF TUPLES MISSING]");
+                return false;
+            }
+        };
+
+        let n_final = sizes[L];
+        let m_final = params.schedule[L - 1];
+
+        // Size check
+        if coeff_tuples.len() != n_final {
             eprintln!(
-                "[FAIL][FINAL CONSTANCY] index={} val={:?} expected={:?}",
-                idx, val, final_const
+                "[FAIL][COEFF TUPLES SIZE] expected={} got={}",
+                n_final,
+                coeff_tuples.len()
             );
             return false;
         }
+        for (b, t) in coeff_tuples.iter().enumerate() {
+            if t.len() != m_final {
+                eprintln!(
+                    "[FAIL][COEFF TUPLE WIDTH] coset={} expected={} got={}",
+                    b, m_final, t.len()
+                );
+                return false;
+            }
+        }
+
+        // Recompute Merkle root from coefficient tuples
+        let coeff_cfg = coeff_tree_config(n_final);
+        let mut coeff_tree = MerkleTreeChannel::new(coeff_cfg.clone(), trace_hash);
+        let coeff_fields: Vec<Vec<F>> = coeff_tuples
+            .iter()
+            .map(|t| coeff_leaf_fields(t))
+            .collect();
+        coeff_tree.push_leaves_parallel(&coeff_fields);
+        let recomputed_root = coeff_tree.finalize();
+
+        if recomputed_root != proof.coeff_root.unwrap() {
+            eprintln!("[FAIL][COEFF MERKLE ROOT MISMATCH]");
+            return false;
+        }
+
+        // Batched degree check
+        let beta = beta_deg.unwrap();
+        if !batched_degree_check_ext(coeff_tuples, beta, params.d_final) {
+            eprintln!("[FAIL][BATCHED DEGREE CHECK]");
+            return false;
+        }
     }
+
+    // ── Precompute per-layer domain generators (avoids repeated Domain::new) ──
+    let omega_per_layer: Vec<F> = (0..L)
+        .map(|ell| Domain::<F>::new(sizes[ell]).unwrap().group_gen)
+        .collect();
+    let omega_final: F = if L > 0 {
+        Domain::<F>::new(sizes[L]).unwrap().group_gen
+    } else {
+        F::one()
+    };
 
     // f₀ tree config
     let f0_th = f0_trace_hash(proof.n0, params.seed_z);
@@ -1217,7 +1745,6 @@ pub fn deep_fri_verify<E: TowerField>(
             expected_i = expected_i % n_next;
         }
 
-        // ── Verify final_index matches the traced position ──
         if qp.final_index != expected_i {
             eprintln!(
                 "[FAIL][FINAL INDEX] q={} expected={} got={}",
@@ -1240,7 +1767,6 @@ pub fn deep_fri_verify<E: TowerField>(
                 return false;
             }
 
-            // Layer 0 f must be a base-field embedding
             let pay0 = &qp.per_layer_payloads[0];
             let pay0_comps = pay0.f_val.to_fp_components();
             let is_base = pay0_comps[1..].iter().all(|&c| c == F::zero());
@@ -1249,7 +1775,6 @@ pub fn deep_fri_verify<E: TowerField>(
                 return false;
             }
 
-            // Cross-check: f₀ tree leaf must match layer 0's base-field value
             let expected_f0_leaf = compute_leaf_hash(
                 &f0_cfg,
                 f0_opening.index,
@@ -1276,7 +1801,7 @@ pub fn deep_fri_verify<E: TowerField>(
             let depth = merkle_depth(sizes[ell], arity);
             let cfg = MerkleChannelCfg::new(vec![arity; depth], ell as u64);
 
-            // 1. Merkle verification against layer root
+            // 1. Merkle verification
             if !MerkleTreeChannel::verify_opening(
                 &cfg,
                 proof.roots[ell],
@@ -1293,22 +1818,16 @@ pub fn deep_fri_verify<E: TowerField>(
                 return false;
             }
 
-            // 3. Leaf binding (3·E::DEGREE base-field elements: f, s, q)
+            // 3. Leaf binding
             let leaf_fields = ext_leaf_fields(pay.f_val, pay.s_val, pay.q_val);
-            let expected_leaf = compute_leaf_hash(
-                &cfg,
-                opening.index,
-                &leaf_fields,
-            );
+            let expected_leaf = compute_leaf_hash(&cfg, opening.index, &leaf_fields);
             if expected_leaf != opening.leaf {
                 eprintln!("[FAIL][LEAF BINDING] q={} ell={}", q, ell);
                 return false;
             }
 
-            // 4. DEEP quotient check (all in E):
-            //    q_ℓ(x_i) · (x_i − z) == f_ℓ(x_i) − f_ℓ(z)
-            let dom_ell = Domain::<F>::new(sizes[ell]).unwrap();
-            let omega_ell = dom_ell.group_gen;
+            // 4. DEEP quotient check
+            let omega_ell = omega_per_layer[ell];
             let x_i = omega_ell.pow([rref.i as u64]);
 
             let fz = proof.fz_per_layer[ell];
@@ -1323,20 +1842,85 @@ pub fn deep_fri_verify<E: TowerField>(
                 return false;
             }
 
-            // 5. Fold consistency: s_ℓ[i] == f_{ℓ+1}[parent(i)]
-            //    Last layer references the committed final codeword.
-            let verified_f_next = if ell + 1 < L {
-                qp.per_layer_payloads[ell + 1].f_val
-            } else {
-                proof.final_codeword[qp.final_index]
-            };
+            // 5. Fold consistency
+            let is_final_layer = ell == L - 1;
 
-            if pay.s_val != verified_f_next {
-                eprintln!(
-                    "[FAIL][FOLD] q={} ell={}\n  s_val={:?}\n  f_next={:?}",
-                    q, ell, pay.s_val, verified_f_next,
+            if is_final_layer && use_coeff_commit {
+                // ── Construction 5.1 (revised): single-point consistency ──
+                //
+                // The coefficient functions C_0*,...,C_{m-1}* are sent in
+                // the clear and have passed the batched degree check, so
+                //   h*(x) = Σ_k C_k*(x^{a_L}) · x^k
+                // is a codeword of RS[D_{L-1}, d_{L-1}].
+                //
+                // We check f^{(L-1)}(x_i) == h*(x_i) at the single
+                // already-opened query point.  Detection probability
+                // is δ_{L-1} by Theorem 4 (revised).  No fibre openings
+                // are required.
+
+                let m = params.schedule[ell];
+                let n_next = sizes[ell] / m;
+                let coset_b = qp.final_index; // = rref.i % n_next
+
+                let coeff_tuples = proof.coeff_tuples.as_ref().unwrap();
+                let coeff_tuple = &coeff_tuples[coset_b];
+
+                // (a) Single-point consistency: f^{(L-1)}(x_i) == Σ_k C_k(z_b) · x_i^k
+                let mut h_star = E::zero();
+                let mut x_pow = F::one();
+                for k in 0..m {
+                    h_star = h_star + coeff_tuple[k] * E::from_fp(x_pow);
+                    x_pow *= x_i;
+                }
+
+                if pay.f_val != h_star {
+                    eprintln!(
+                        "[FAIL][SINGLE-POINT CONSISTENCY] q={} ell={}\n  f_val={:?}\n  h_star={:?}",
+                        q, ell, pay.f_val, h_star,
+                    );
+                    return false;
+                }
+
+                // (b) Fold-value binding: Σ_k C_k(z_b) · α^k == eval(final_poly, z_b)
+                let alpha_final = alpha_layers[L - 1];
+                let alpha_pows = build_ext_pows(alpha_final, m);
+                let mut fold_val = E::zero();
+                for k in 0..m {
+                    fold_val = fold_val + coeff_tuple[k] * alpha_pows[k];
+                }
+
+                let x_final = E::from_fp(omega_final.pow([qp.final_index as u64]));
+                let expected_final = eval_final_poly_ext(
+                    &proof.final_poly_coeffs,
+                    x_final,
                 );
-                return false;
+
+                if fold_val != expected_final {
+                    eprintln!(
+                        "[FAIL][COEFF FOLD VALUE] q={} fold={:?} poly_eval={:?}",
+                        q, fold_val, expected_final
+                    );
+                    return false;
+                }
+            } else {
+                // ── Original protocol: s-value fold consistency ──
+                let verified_f_next = if ell + 1 < L {
+                    qp.per_layer_payloads[ell + 1].f_val
+                } else {
+                    // Evaluate final polynomial at the query's domain point
+                    let x_final = E::from_fp(
+                        omega_final.pow([qp.final_index as u64]),
+                    );
+                    eval_final_poly_ext(&proof.final_poly_coeffs, x_final)
+                };
+
+                if pay.s_val != verified_f_next {
+                    eprintln!(
+                        "[FAIL][FOLD] q={} ell={}\n  s_val={:?}\n  f_next={:?}",
+                        q, ell, pay.s_val, verified_f_next,
+                    );
+                    return false;
+                }
             }
         }
     }
@@ -1613,6 +2197,188 @@ mod tests {
     fn test_ext_deep_quotient_consistency() {
         test_ext_deep_quotient_consistency_for::<CubeExt<GoldilocksCubeConfig>>();
     }
+
+    // ────────────────────────────────────────────────────────────────
+    //  Construction 5.1 specific tests
+    // ────────────────────────────────────────────────────────────────
+
+    /// Verify that interpolation coefficients, when evaluated at the fibre
+    /// points, reproduce the original fibre values.
+    fn test_coset_interpolation_roundtrip_for<E: TowerField>() {
+        let mut rng = StdRng::seed_from_u64(123);
+        let n = 64usize;
+        let m = 4usize;
+        let n_next = n / m;
+
+        let dom = Domain::<TestField>::new(n).unwrap();
+        let omega = dom.group_gen;
+        let zeta = omega.pow([n_next as u64]); // primitive m-th root
+
+        // Random extension-field evaluations
+        let evals: Vec<E> = (0..n)
+            .map(|_| {
+                let comps: Vec<TestField> = (0..E::DEGREE)
+                    .map(|_| TestField::from(rng.gen::<u64>()))
+                    .collect();
+                E::from_fp_components(&comps).unwrap()
+            })
+            .collect();
+
+        let coeff_tuples = extract_all_coset_coefficients(&evals, omega, m);
+
+        assert_eq!(coeff_tuples.len(), n_next);
+        assert_eq!(coeff_tuples[0].len(), m);
+
+        // For each coset, verify P(x_j) == evals[b + j * n_next]
+        for b in 0..n_next {
+            let omega_b = omega.pow([b as u64]);
+            for j in 0..m {
+                let x_j = omega.pow([(b + j * n_next) as u64]);
+                // Evaluate P(x_j) = Σ C_i * x_j^i
+                let mut eval = E::zero();
+                let mut x_pow = F::one();
+                for i in 0..m {
+                    eval = eval + coeff_tuples[b][i] * E::from_fp(x_pow);
+                    x_pow *= x_j;
+                }
+                assert_eq!(
+                    eval,
+                    evals[b + j * n_next],
+                    "Interpolation roundtrip failed at coset b={} fibre j={}",
+                    b, j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_coset_interpolation_roundtrip() {
+        test_coset_interpolation_roundtrip_for::<CubeExt<GoldilocksCubeConfig>>();
+    }
+
+    /// Verify that for a low-degree polynomial, the coefficient functions
+    /// are themselves low-degree (Lemma 1).
+    fn test_coeff_functions_low_degree_for<E: TowerField>() {
+        let mut rng = StdRng::seed_from_u64(456);
+        let n = 64usize;
+        let m = 4usize;
+        let n_next = n / m;
+        let degree = m - 1; // degree < m so d_final = 1
+
+        let dom = GeneralEvaluationDomain::<TestField>::new(n).unwrap();
+        let poly = DensePolynomial::<TestField>::rand(degree, &mut rng);
+        let evals = dom.fft(poly.coeffs());
+
+        let evals_ext: Vec<E> = evals.iter().map(|&x| E::from_fp(x)).collect();
+
+        let omega = dom.group_gen();
+        let coeff_tuples = extract_all_coset_coefficients(&evals_ext, omega, m);
+
+        // Each C_i should be constant (degree < d_final = 1)
+        for i in 0..m {
+            let c_i_0 = coeff_tuples[0][i];
+            for b in 1..n_next {
+                assert_eq!(
+                    coeff_tuples[b][i], c_i_0,
+                    "C_{} not constant: coset 0 = {:?}, coset {} = {:?}",
+                    i, c_i_0, b, coeff_tuples[b][i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_coeff_functions_low_degree() {
+        test_coeff_functions_low_degree_for::<CubeExt<GoldilocksCubeConfig>>();
+    }
+
+    /// Verify the interpolation-based fold matches the polynomial evaluation.
+    fn test_interpolation_fold_matches_poly_eval_for<E: TowerField>() {
+        let mut rng = StdRng::seed_from_u64(789);
+        let n = 64usize;
+        let m = 4usize;
+        let n_next = n / m;
+        let degree = m - 1;
+
+        let dom = GeneralEvaluationDomain::<TestField>::new(n).unwrap();
+        let poly = DensePolynomial::<TestField>::rand(degree, &mut rng);
+        let evals = dom.fft(poly.coeffs());
+        let evals_ext: Vec<E> = evals.iter().map(|&x| E::from_fp(x)).collect();
+
+        let omega = dom.group_gen();
+
+        let alpha_comps: Vec<TestField> = (0..E::DEGREE)
+            .map(|i| TestField::from((31 + i * 17) as u64))
+            .collect();
+        let alpha = E::from_fp_components(&alpha_comps).unwrap();
+
+        let coeff_tuples = extract_all_coset_coefficients(&evals_ext, omega, m);
+        let folded = interpolation_fold_ext(&coeff_tuples, alpha);
+
+        // The fold at each coset should equal P_z(α)
+        // For a globally low-degree polynomial, all cosets yield the same P(α)
+        assert_eq!(folded.len(), n_next);
+
+        // Verify the fold is constant (since degree < m and d_final = 1)
+        let fold_0 = folded[0];
+        for b in 1..n_next {
+            assert_eq!(
+                folded[b], fold_0,
+                "Interpolation fold not constant at coset {}",
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_interpolation_fold_matches_poly_eval() {
+        test_interpolation_fold_matches_poly_eval_for::<CubeExt<GoldilocksCubeConfig>>();
+    }
+
+    /// Verify the batched degree check passes for honest coefficients
+    /// and fails for corrupted ones.
+    fn test_batched_degree_check_for<E: TowerField>() {
+        let mut rng = StdRng::seed_from_u64(321);
+        let n = 64usize;
+        let m = 4usize;
+        let n_next = n / m;
+        let degree = m - 1;
+
+        let dom = GeneralEvaluationDomain::<TestField>::new(n).unwrap();
+        let poly = DensePolynomial::<TestField>::rand(degree, &mut rng);
+        let evals = dom.fft(poly.coeffs());
+        let evals_ext: Vec<E> = evals.iter().map(|&x| E::from_fp(x)).collect();
+
+        let omega = dom.group_gen();
+        let coeff_tuples = extract_all_coset_coefficients(&evals_ext, omega, m);
+
+        let beta_comps: Vec<TestField> = (0..E::DEGREE)
+            .map(|i| TestField::from((7 + i * 3) as u64))
+            .collect();
+        let beta = E::from_fp_components(&beta_comps).unwrap();
+
+        // Honest: should pass with d_final = 1
+        assert!(
+            batched_degree_check_ext(&coeff_tuples, beta, 1),
+            "Batched degree check should pass for honest coefficients"
+        );
+
+        // Corrupt one coefficient
+        let mut bad_tuples = coeff_tuples.clone();
+        bad_tuples[1][0] = bad_tuples[1][0] + E::from_fp(TestField::one());
+
+        assert!(
+            !batched_degree_check_ext(&bad_tuples, beta, 1),
+            "Batched degree check should fail for corrupted coefficients"
+        );
+    }
+
+    #[test]
+    fn test_batched_degree_check() {
+        test_batched_degree_check_for::<CubeExt<GoldilocksCubeConfig>>();
+    }
+
+    // ── Existing tests (unchanged) ──
 
     #[test]
     fn test_fri_local_consistency_check_soundness() {

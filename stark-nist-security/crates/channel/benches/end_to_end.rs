@@ -249,6 +249,8 @@ fn bench_e2e_mf_fri(c: &mut Criterion) {
                 schedule: normalized_schedule.clone(),
                 r,
                 seed_z,
+                coeff_commit_final: true,
+                d_final: 1,
             };
 
             // ---------------- Prove (using selected Ext) ----------------
