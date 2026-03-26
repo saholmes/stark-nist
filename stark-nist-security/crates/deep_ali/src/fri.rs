@@ -1,3 +1,4 @@
+
 #![allow(dead_code)]
 #![allow(non_snake_case)]
 #![allow(unused_variables)]
@@ -667,11 +668,12 @@ pub struct LayerQueryRef {
     pub parent_pos: usize,
 }
 
+/// Per-query index path through the folding layers.
+/// No longer generic — it carries only indices, not field values.
 #[derive(Clone)]
-pub struct FriQueryOpenings<E: TowerField> {
+pub struct FriQueryOpenings {
     pub per_layer_refs: Vec<LayerQueryRef>,
     pub final_index: usize,
-    pub final_pair: (E, E),
 }
 
 /// Per-layer opened values — all in E.
@@ -688,7 +690,6 @@ pub struct FriQueryPayload<E: TowerField> {
     pub per_layer_payloads: Vec<LayerOpenPayload<E>>,
     pub f0_opening: MerkleOpening,
     pub final_index: usize,
-    pub final_pair: (E, E),
 }
 
 #[derive(Clone)]
@@ -707,6 +708,8 @@ pub struct DeepFriProof<E: TowerField> {
     pub f0_openings: Vec<MerkleOpening>,
     pub queries: Vec<FriQueryPayload<E>>,
     pub fz_per_layer: Vec<E>,
+    /// The entire final-layer codeword, committed before query derivation.
+    pub final_codeword: Vec<E>,
     pub n0: usize,
     pub omega0: F,
 }
@@ -839,17 +842,12 @@ pub fn fri_build_transcript<E: TowerField>(
         let cfg = MerkleChannelCfg::new(vec![arity; depth], ell as u64);
         let mut tree = MerkleTreeChannel::new(cfg, trace_hash);
 
-        //for i in 0..cur_size {
-        //    let fields = ext_leaf_fields(cur_f[i], s[i], q[i]);
-        //    tree.push_leaf(&fields);
-        //}
-
         // After (parallel):
         let all_fields: Vec<Vec<F>> = (0..cur_size)
             .map(|i| ext_leaf_fields(cur_f[i], s[i], q[i]))
             .collect();
         tree.push_leaves_parallel(&all_fields);
-        
+
         let layer_root = tree.finalize();
 
         layer_commitments.push(FriLayerCommitment {
@@ -903,11 +901,11 @@ pub fn fri_prove_queries<E: TowerField>(
     st: &FriProverState<E>,
     r: usize,
     query_seed: F,
-) -> (Vec<FriQueryOpenings<E>>, Vec<[u8; HASH_BYTES]>, FriLayerProofs, Vec<MerkleOpening>) {
+) -> (Vec<FriQueryOpenings>, Vec<[u8; HASH_BYTES]>, FriLayerProofs, Vec<MerkleOpening>) {
     let L = st.transcript.schedule.len();
     let mut all_refs = Vec::with_capacity(r);
     let n0 = st.transcript.layers.first().map_or(0, |l| l.n);
-    
+
     eprintln!("[DIAG] HASH_BYTES = {}", HASH_BYTES);
 
     for q in 0..r {
@@ -937,15 +935,10 @@ pub fn fri_prove_queries<E: TowerField>(
         all_refs.push(FriQueryOpenings {
             per_layer_refs,
             final_index: i,
-            final_pair: (
-                st.f_layers_ext[L][i],
-                st.f_layers_ext[L][0],
-            ),
         });
     }
 
     // ── Rebuild f₀ Merkle tree (base-field trace) ──
-    // FIX: use st.seed_z (was previously hardcoded to 0)
     let f0_th = f0_trace_hash(n0, st.seed_z);
     let f0_cfg = f0_tree_config(n0);
     let mut f0_tree = MerkleTreeChannel::new(f0_cfg, f0_th);
@@ -1009,7 +1002,11 @@ pub fn deep_fri_prove<E: TowerField>(
 
     let st: FriProverState<E> = fri_build_transcript(f0, domain0, &prover_params);
 
-    // Derive query_seed by replaying the transcript
+    let L = params.schedule.len();
+    let final_codeword = st.f_layers_ext[L].clone();
+
+    // Derive query_seed by replaying the transcript, now absorbing
+    // the final codeword before squeezing query_seed.
     let query_seed = {
         let mut tr = Transcript::new_matching_hash(b"FRI/FS");
         bind_statement_to_transcript::<E>(
@@ -1031,6 +1028,11 @@ pub fn deep_fri_prove<E: TowerField>(
             let _ = challenge_ext::<E>(&mut tr, b"alpha");
             absorb_ext(&mut tr, st.fz_layers[ell]);
             tr.absorb_bytes(&st.transcript.layers[ell].root);
+        }
+
+        // ── Absorb entire final codeword before query derivation ──
+        for &val in &final_codeword {
+            absorb_ext::<E>(&mut tr, val);
         }
 
         tr.challenge(b"query_seed")
@@ -1057,7 +1059,6 @@ pub fn deep_fri_prove<E: TowerField>(
             per_layer_payloads: payloads,
             f0_opening: f0_openings[qi].clone(),
             final_index: q.final_index,
-            final_pair: q.final_pair,
         });
     }
 
@@ -1068,6 +1069,7 @@ pub fn deep_fri_prove<E: TowerField>(
         f0_openings: queries.iter().map(|q| q.f0_opening.clone()).collect(),
         queries,
         fz_per_layer: st.fz_layers.clone(),
+        final_codeword,
         n0: domain0.size,
         omega0: domain0.omega,
     }
@@ -1088,10 +1090,12 @@ pub fn deep_fri_proof_size_bytes<E: TowerField>(proof: &DeepFriProof<E>) -> usiz
     // fz_per_layer (one E per layer)
     bytes += proof.fz_per_layer.len() * ext_bytes;
 
-    // Query payloads: 3 E per layer + 2 E for final_pair
+    // Final codeword (sent in the clear)
+    bytes += proof.final_codeword.len() * ext_bytes;
+
+    // Query payloads: 3 E per layer
     for q in &proof.queries {
         bytes += q.per_layer_payloads.len() * 3 * ext_bytes;
-        bytes += 2 * ext_bytes;
     }
 
     // f₀ Merkle openings
@@ -1153,7 +1157,37 @@ pub fn deep_fri_verify<E: TowerField>(
         }
     }
 
+    // ── Absorb entire final codeword before query derivation ──
+    for &val in &proof.final_codeword {
+        absorb_ext::<E>(&mut tr, val);
+    }
+
     let query_seed: F = tr.challenge(b"query_seed");
+
+    // ── Global constancy check on the committed final codeword ──
+    if proof.final_codeword.is_empty() {
+        eprintln!("[FAIL][FINAL CODEWORD EMPTY]");
+        return false;
+    }
+    let expected_final_size = sizes[L];
+    if proof.final_codeword.len() != expected_final_size {
+        eprintln!(
+            "[FAIL][FINAL CODEWORD SIZE] expected={} got={}",
+            expected_final_size,
+            proof.final_codeword.len()
+        );
+        return false;
+    }
+    let final_const = proof.final_codeword[0];
+    for (idx, &val) in proof.final_codeword.iter().enumerate().skip(1) {
+        if val != final_const {
+            eprintln!(
+                "[FAIL][FINAL CONSTANCY] index={} val={:?} expected={:?}",
+                idx, val, final_const
+            );
+            return false;
+        }
+    }
 
     // f₀ tree config
     let f0_th = f0_trace_hash(proof.n0, params.seed_z);
@@ -1181,6 +1215,15 @@ pub fn deep_fri_verify<E: TowerField>(
             }
             let n_next = sizes[ell] / params.schedule[ell];
             expected_i = expected_i % n_next;
+        }
+
+        // ── Verify final_index matches the traced position ──
+        if qp.final_index != expected_i {
+            eprintln!(
+                "[FAIL][FINAL INDEX] q={} expected={} got={}",
+                q, expected_i, qp.final_index
+            );
+            return false;
         }
 
         // ── f₀ Merkle opening ──
@@ -1281,10 +1324,11 @@ pub fn deep_fri_verify<E: TowerField>(
             }
 
             // 5. Fold consistency: s_ℓ[i] == f_{ℓ+1}[parent(i)]
+            //    Last layer references the committed final codeword.
             let verified_f_next = if ell + 1 < L {
                 qp.per_layer_payloads[ell + 1].f_val
             } else {
-                qp.final_pair.0
+                proof.final_codeword[qp.final_index]
             };
 
             if pay.s_val != verified_f_next {
@@ -1294,15 +1338,6 @@ pub fn deep_fri_verify<E: TowerField>(
                 );
                 return false;
             }
-        }
-
-        // Final-layer constancy
-        if qp.final_pair.0 != qp.final_pair.1 {
-            eprintln!(
-                "[FAIL][FINAL CONSTANCY] q={} f={:?} s={:?}",
-                q, qp.final_pair.0, qp.final_pair.1,
-            );
-            return false;
         }
     }
 
