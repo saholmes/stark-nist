@@ -1,7 +1,7 @@
 // src/trace_import.rs
 
 use ark_goldilocks::Goldilocks as F;
-use ark_ff::{Zero};
+use ark_ff::Zero;
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain as Domain};
 
 /// Four evaluation vectors over the FRI domain, derived from a real
@@ -71,6 +71,62 @@ pub fn real_trace_inputs(n0: usize, rate_inv: usize) -> RealTraceInputs {
         e_eval: evals.remove(0),
         t_eval: evals.remove(0),
     }
+}
+
+/// Convert an arbitrary execution trace (produced by an AIR workload)
+/// into `RealTraceInputs` by interpolating each column and LDE-evaluating
+/// on the extended domain.
+///
+/// `trace_columns`: each inner Vec is one column of length `n0 / blowup`.
+/// `n0`:            FRI / extended-evaluation domain size (power of 2).
+/// `blowup`:        rate inverse (typically 4).
+///
+/// The function maps the first four columns to `a_eval … t_eval`.
+/// If the trace has fewer than four columns, columns are reused with
+/// wraparound (same strategy as `import_winterfell_trace`).
+/// If the trace has more than four columns, the extra columns are ignored.
+pub fn trace_inputs_from_air(
+    trace_columns: Vec<Vec<F>>,
+    n0: usize,
+    blowup: usize,
+) -> RealTraceInputs {
+    let num_cols = trace_columns.len();
+    assert!(num_cols >= 1, "need at least 1 trace column");
+    assert!(n0.is_power_of_two());
+    assert!(blowup >= 2 && blowup.is_power_of_two());
+
+    let trace_len = n0 / blowup;
+    assert!(trace_len >= 2, "trace too short");
+
+    // Sanity-check that every column has the expected length
+    for (i, col) in trace_columns.iter().enumerate() {
+        assert_eq!(
+            col.len(),
+            trace_len,
+            "column {} has length {} but expected {}",
+            i,
+            col.len(),
+            trace_len
+        );
+    }
+
+    let trace_dom = Domain::<F>::new(trace_len).unwrap();
+    let lde_dom   = Domain::<F>::new(n0).unwrap();
+
+    let lde = |col: &[F]| -> Vec<F> {
+        let coeffs = trace_dom.ifft(col);
+        let mut padded = coeffs;
+        padded.resize(n0, F::zero());
+        lde_dom.fft(&padded)
+    };
+
+    // Map columns to the four required vectors with wraparound
+    let a_eval = lde(&trace_columns[0]);
+    let s_eval = lde(&trace_columns[1 % num_cols]);
+    let e_eval = lde(&trace_columns[2 % num_cols]);
+    let t_eval = lde(&trace_columns[3 % num_cols]);
+
+    RealTraceInputs { a_eval, s_eval, e_eval, t_eval }
 }
 
 /// Same as above but reads trace columns from a binary file exported

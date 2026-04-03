@@ -54,3 +54,7 @@ harness = false
 [[bench]]
 name = "end_to_end"
 harness = false
+
+[[bench]]
+name = "multi_air_end_to_end"
+harness = false
